@@ -194,6 +194,9 @@ class UserPromptNode(AgentNode[DepsT, NodeRunEndT]):
     system_prompt_dynamic_functions: dict[str, _system_prompt.SystemPromptRunner[DepsT]] = dataclasses.field(
         default_factory=dict
     )
+    context_injection_functions: list[_system_prompt.ContextInjectionRunner[DepsT]] = dataclasses.field(
+        default_factory=list
+    )
 
     async def run(  # noqa: C901
         self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]]
@@ -261,12 +264,24 @@ class UserPromptNode(AgentNode[DepsT, NodeRunEndT]):
         if messages:
             await self._reevaluate_dynamic_prompts(messages, run_context)
 
+        ephemeral_parts: list[_messages.ModelRequestPart] = []
+
         if next_message:
             await self._reevaluate_dynamic_prompts([next_message], run_context)
         else:
             parts: list[_messages.ModelRequestPart] = []
             if not messages:
                 parts.extend(await self._sys_parts(run_context))
+
+            # Run context injection
+            for injection_runner in self.context_injection_functions:
+                content = await injection_runner.run(run_context)
+                if content:
+                    part = _messages.SystemPromptPart(content)
+                    if injection_runner.ephemeral:
+                        ephemeral_parts.append(part)
+                    else:
+                        parts.append(part)
 
             if self.user_prompt is not None:
                 parts.append(_messages.UserPromptPart(self.user_prompt))
@@ -275,10 +290,10 @@ class UserPromptNode(AgentNode[DepsT, NodeRunEndT]):
 
         next_message.instructions = instructions
 
-        if not messages and not next_message.parts and not next_message.instructions:
-            raise exceptions.UserError('No message history, user prompt, or instructions provided')
+        if not messages and not next_message.parts and not next_message.instructions and not ephemeral_parts:
+             raise exceptions.UserError('No message history, user prompt, or instructions provided')
 
-        return ModelRequestNode[DepsT, NodeRunEndT](request=next_message)
+        return ModelRequestNode[DepsT, NodeRunEndT](request=next_message, ephemeral_request_parts=ephemeral_parts)
 
     async def _handle_deferred_tool_results(  # noqa: C901
         self,
@@ -431,6 +446,7 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
     """The node that makes a request to the model using the last message in state.message_history."""
 
     request: _messages.ModelRequest
+    ephemeral_request_parts: list[_messages.ModelRequestPart] = dataclasses.field(default_factory=list)
 
     _result: CallToolsNode[DepsT, NodeRunEndT] | None = field(repr=False, init=False, default=None)
     _did_stream: bool = field(repr=False, init=False, default=False)
@@ -517,6 +533,26 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
         # Update the new message index to ensure `result.new_messages()` returns the correct messages
         ctx.deps.new_message_index -= len(original_history) - len(message_history)
 
+        # Inject ephemeral parts into the message history sent to the model (but not state.message_history)
+        if self.ephemeral_request_parts:
+            # We need to construct a new ModelRequest that combines the preserved request + ephemeral parts
+            # self.request was already appended to state.message_history, so it's the last message.
+            # We want to treat ephemeral parts as if they were part of this request, but only for the model call.
+            
+            # Create a shallow copy of the message history so we don't modify the state
+            message_history = list(message_history)
+            
+            last_msg = message_history[-1]
+            if isinstance(last_msg, _messages.ModelRequest):
+                 # Insert ephemeral parts before the user prompt parts of the last message
+                 new_parts = list(self.ephemeral_request_parts) + list(last_msg.parts)
+                 message_history[-1] = dataclasses.replace(last_msg, parts=new_parts)
+            else:
+                 # Should not happen typically if we just appended self.request, but just in case
+                 # we append a new request with just the ephemeral parts (though this might be weird if no user prompt follows)
+                 # Ideally, ModelRequestNode always has a request.
+                 pass
+        
         # Merge possible consecutive trailing `ModelRequest`s into one, with tool call parts before user parts,
         # but don't store it in the message history on state. This is just for the benefit of model classes that want clear user/assistant boundaries.
         # See `tests/test_tools.py::test_parallel_tool_return_with_deferred` for an example where this is necessary

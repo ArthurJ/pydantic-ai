@@ -33,3 +33,13 @@ class SystemPromptRunner(Generic[AgentDepsT]):
         else:
             function = cast(Callable[[Any], str | None], self.function)
             return await _utils.run_in_executor(function, *args)
+
+
+@dataclass
+class ContextInjectionRunner(SystemPromptRunner[AgentDepsT]):
+    ephemeral: bool = False
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Context injection is always dynamic
+        self.dynamic = True

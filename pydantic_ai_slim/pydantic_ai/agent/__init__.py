@@ -153,6 +153,9 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
     _system_prompt_dynamic_functions: dict[str, _system_prompt.SystemPromptRunner[AgentDepsT]] = dataclasses.field(
         repr=False
     )
+    _context_injection_functions: list[_system_prompt.ContextInjectionRunner[AgentDepsT]] = dataclasses.field(
+        repr=False
+    )
     _function_toolset: FunctionToolset[AgentDepsT] = dataclasses.field(repr=False)
     _output_toolset: OutputToolset[AgentDepsT] | None = dataclasses.field(repr=False)
     _user_toolsets: list[AbstractToolset[AgentDepsT]] = dataclasses.field(repr=False)
@@ -349,6 +352,7 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
         self._system_prompts = (system_prompt,) if isinstance(system_prompt, str) else tuple(system_prompt)
         self._system_prompt_functions = []
         self._system_prompt_dynamic_functions = {}
+        self._context_injection_functions = []
 
         self._max_result_retries = output_retries if output_retries is not None else retries
         self._max_tool_retries = retries
@@ -683,6 +687,7 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
             system_prompts=self._system_prompts,
             system_prompt_functions=self._system_prompt_functions,
             system_prompt_dynamic_functions=self._system_prompt_dynamic_functions,
+            context_injection_functions=self._context_injection_functions,
         )
 
         agent_name = self.name or 'agent'
@@ -1069,6 +1074,60 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
         else:
             assert not dynamic, "dynamic can't be True in this case"
             self._system_prompt_functions.append(_system_prompt.SystemPromptRunner[AgentDepsT](func, dynamic=dynamic))
+            return func
+
+    @overload
+    def context_injection(
+        self, func: Callable[[RunContext[AgentDepsT]], Awaitable[str | None]], /
+    ) -> Callable[[RunContext[AgentDepsT]], Awaitable[str | None]]: ...
+
+    @overload
+    def context_injection(self, func: Callable[[], str | None], /) -> Callable[[], str | None]: ...
+
+    @overload
+    def context_injection(self, func: Callable[[], Awaitable[str | None]], /) -> Callable[[], Awaitable[str | None]]: ...
+
+    @overload
+    def context_injection(
+        self, /, *, ephemeral: bool = False
+    ) -> Callable[[_system_prompt.SystemPromptFunc[AgentDepsT]], _system_prompt.SystemPromptFunc[AgentDepsT]]: ...
+
+    def context_injection(
+        self,
+        func: _system_prompt.SystemPromptFunc[AgentDepsT] | None = None,
+        /,
+        *,
+        ephemeral: bool = False,
+    ) -> (
+        Callable[[_system_prompt.SystemPromptFunc[AgentDepsT]], _system_prompt.SystemPromptFunc[AgentDepsT]]
+        | _system_prompt.SystemPromptFunc[AgentDepsT]
+    ):
+        """Decorator to register a context injection function.
+
+        Optionally takes [`RunContext`][pydantic_ai.tools.RunContext] as its only argument.
+        Can decorate a sync or async functions.
+
+        The decorator can be used either bare (`agent.context_injection`) or as a function call
+        (`agent.context_injection(...)`).
+
+        If `ephemeral` is True, the injected content is sent to the model for the current inference but is NOT saved to the persistent message history.
+        If `ephemeral` is False (default), the injected content is saved to the persistent message history.
+        """
+        if func is None:
+
+            def decorator(
+                func_: _system_prompt.SystemPromptFunc[AgentDepsT],
+            ) -> _system_prompt.SystemPromptFunc[AgentDepsT]:
+                runner = _system_prompt.ContextInjectionRunner[AgentDepsT](func_, ephemeral=ephemeral)
+                self._context_injection_functions.append(runner)
+                return func_
+
+            return decorator
+        else:
+            assert not ephemeral, "ephemeral can't be True in this case"
+            self._context_injection_functions.append(
+                _system_prompt.ContextInjectionRunner[AgentDepsT](func, ephemeral=ephemeral)
+            )
             return func
 
     @overload
